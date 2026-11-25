@@ -4596,8 +4596,90 @@ unsafe fn translated_graphics_pso(this: *mut c_void, f: PsoFn, desc: *const c_vo
     with_switch_fallback(|| translated_graphics_pso_once(this, f, desc, riid, ppv))
 }
 
+/// A console VS / PS pipeline as the PC builds it: its translated shaders and static samplers, the
+/// generated GS of a rect list, and the description with them and the PC's formats and topology,
+/// but no root signature yet (the caller's, for these samplers). `translated_graphics_pso_once`
+/// and `xcl shaders --precompile --graphics` both make it here, so a pipeline built ahead of a
+/// run has the driver blob key (`graphics_blob_key`) the title's run looks up.
+pub(crate) struct GraphicsBuild {
+    pub copy: D3D12_GRAPHICS_PIPELINE_STATE_DESC,
+    pub vs_dxil: Vec<u8>,
+    pub ps_dxil: Option<Vec<u8>>,
+    pub rect_gs: Option<Vec<u8>>,
+    pub samplers: Vec<crate::gpu::recomp::pso::StaticSampler>,
+    /// the console PS's hash (0: none)
+    pub ps_hash: u64,
+}
+
+impl GraphicsBuild {
+    /// The key and the file name of its driver blob (`graphics_blob_key`).
+    pub(crate) fn blob_key(&self) -> (u64, usize) {
+        // SAFETY: `copy`'s input layout and shaders point into `self` or the title's description
+        unsafe { graphics_blob_key(&self.copy, &self.vs_dxil, self.ps_dxil.as_deref(), self.rect_gs.as_deref(), &self.samplers) }
+    }
+}
+
+/// `d`'s console VS `vs` (and its PS) translated for a GPU that runs a VS / PS in waves of 32
+/// (`split`) and the title's memory `windows` (`pso::mem_windows` in its run; given, since
+/// `xcl shaders` has no title's memory to count them in), and the description that goes with
+/// them. None: a translation failed (noted).
+///
+/// # Safety
+/// `d`'s pointers (shaders, input layout) are valid.
+pub(crate) unsafe fn graphics_build(d: &D3D12_GRAPHICS_PIPELINE_STATE_DESC, vs: &[u8], split: bool, windows: u32) -> Option<GraphicsBuild> {
+    use crate::gpu::recomp::pso::{console_to_dxil_in, is_console, Stage};
+    let vs_c = match console_to_dxil_in(vs, Stage::Vertex, 0, split, windows) {
+        Ok(b) => b,
+        Err(e) => {
+            note_translation_error(format!("VS: {e}"));
+            return None;
+        }
+    };
+    let mut samplers = vs_c.samplers;
+    let vs_dxil = vs_c.dxil;
+    let ps_dxil = match shader_bytes(&d.PS) {
+        Some(p) if is_console(p) => match console_to_dxil_in(p, Stage::Pixel, samplers.len() as u32, split, windows) {
+            Ok(b) => {
+                samplers.extend(b.samplers);
+                Some(b.dxil)
+            }
+            Err(e) => {
+                note_translation_error(format!("PS: {e}"));
+                return None;
+            }
+        },
+        Some(p) => Some(p.to_vec()),
+        None => None,
+    };
+    let mut copy: D3D12_GRAPHICS_PIPELINE_STATE_DESC = std::ptr::read(d);
+    // (the title's root signature is not this pipeline's: the caller sets XCL's)
+    copy.pRootSignature = std::mem::ManuallyDrop::new(None);
+    copy.VS = bytecode(&vs_dxil);
+    copy.PS = ps_dxil.as_deref().map(bytecode).unwrap_or_default();
+    copy.CachedPSO = D3D12_CACHED_PIPELINE_STATE::default();
+    // a rect list pipeline: the fourth corner of each rect comes from a generated GS; without
+    // it each rect is drawn as the triangle of its three vertices
+    let rect_gs = if d.PrimitiveTopologyType.0 == RECT_LIST_TYPE && copy.GS.pShaderBytecode.is_null() {
+        rect_list_gs(vs, shader_bytes(&d.PS)).map_err(|e| note_translation_error(format!("rect list drawn as triangles: {e}"))).ok()
+    } else {
+        None
+    };
+    if let Some(gs) = &rect_gs {
+        copy.GS = bytecode(gs);
+    }
+    pc_topology_type(&mut copy);
+    let ps_hash = shader_bytes(&d.PS).map_or(0, crate::gpu::shader::fnv64);
+    if debug_pso_switch("XCL_DEBUG_NO_STENCIL", ps_hash) {
+        copy.DepthStencilState.StencilEnable = false.into();
+    }
+    if debug_pso_switch("XCL_DEBUG_NO_CULL", ps_hash) {
+        copy.RasterizerState.CullMode = D3D12_CULL_MODE_NONE;
+    }
+    Some(GraphicsBuild { copy, vs_dxil, ps_dxil, rect_gs, samplers, ps_hash })
+}
+
 unsafe fn translated_graphics_pso_once(this: *mut c_void, f: PsoFn, desc: *const c_void, riid: *const GUID, ppv: *mut *mut c_void) -> Option<HRESULT> {
-    use crate::gpu::recomp::pso::{console_to_dxil_for, is_console, Stage};
+    use crate::gpu::recomp::pso::is_console;
     if !crate::gpu::shader::readable(desc as usize, std::mem::size_of::<D3D12_GRAPHICS_PIPELINE_STATE_DESC>()) {
         return None;
     }
@@ -4621,54 +4703,11 @@ unsafe fn translated_graphics_pso_once(this: *mut c_void, f: PsoFn, desc: *const
     // a GPU that can run 32-lane waves may run a wave64 VS / PS in waves of 32 (the driver
     // picks; RDNA2 does for pixel shaders): the lanes 32..63 it reads come from `upper_lanes`
     // (split_wave64)
-    let split = graphics_wave32(this);
-    let vs_c = match console_to_dxil_for(vs, Stage::Vertex, 0, split) {
-        Ok(b) => b,
-        Err(e) => {
-            note_translation_error(format!("VS: {e}"));
-            return None;
-        }
-    };
-    let mut samplers = vs_c.samplers;
-    let vs_dxil = vs_c.dxil;
-    let ps_dxil = match shader_bytes(&d.PS) {
-        Some(p) if is_console(p) => match console_to_dxil_for(p, Stage::Pixel, samplers.len() as u32, split) {
-            Ok(b) => {
-                samplers.extend(b.samplers);
-                Some(b.dxil)
-            }
-            Err(e) => {
-                note_translation_error(format!("PS: {e}"));
-                return None;
-            }
-        },
-        Some(p) => Some(p.to_vec()),
-        None => None,
-    };
-    let rs = abi_rs_for(this, &samplers)?;
-    let mut copy: D3D12_GRAPHICS_PIPELINE_STATE_DESC = std::ptr::read(d);
+    let g = graphics_build(d, vs, graphics_wave32(this), crate::gpu::recomp::pso::mem_windows())?;
+    let rs = abi_rs_for(this, &g.samplers)?;
+    // (moving the vectors out keeps their buffers, which `copy` points into)
+    let GraphicsBuild { mut copy, vs_dxil, ps_dxil, rect_gs, samplers, ps_hash } = g;
     copy.pRootSignature = std::mem::transmute::<*mut c_void, std::mem::ManuallyDrop<Option<ID3D12RootSignature>>>(rs);
-    copy.VS = bytecode(&vs_dxil);
-    copy.PS = ps_dxil.as_deref().map(bytecode).unwrap_or_default();
-    copy.CachedPSO = D3D12_CACHED_PIPELINE_STATE::default();
-    // a rect list pipeline: the fourth corner of each rect comes from a generated GS; without
-    // it each rect is drawn as the triangle of its three vertices
-    let rect_gs = if d.PrimitiveTopologyType.0 == RECT_LIST_TYPE && copy.GS.pShaderBytecode.is_null() {
-        rect_list_gs(vs, shader_bytes(&d.PS)).map_err(|e| note_translation_error(format!("rect list drawn as triangles: {e}"))).ok()
-    } else {
-        None
-    };
-    if let Some(gs) = &rect_gs {
-        copy.GS = bytecode(gs);
-    }
-    pc_topology_type(&mut copy);
-    let ps_hash = shader_bytes(&d.PS).map_or(0, crate::gpu::shader::fnv64);
-    if debug_pso_switch("XCL_DEBUG_NO_STENCIL", ps_hash) {
-        copy.DepthStencilState.StencilEnable = false.into();
-    }
-    if debug_pso_switch("XCL_DEBUG_NO_CULL", ps_hash) {
-        copy.RasterizerState.CullMode = D3D12_CULL_MODE_NONE;
-    }
     let bytes = vs_dxil.len() + ps_dxil.as_ref().map_or(0, Vec::len) + rect_gs.as_ref().map_or(0, Vec::len);
     let gkey = graphics_blob_key(&copy, &vs_dxil, ps_dxil.as_deref(), rect_gs.as_deref(), &samplers);
     let mut cached = graphics_blob(gkey);
