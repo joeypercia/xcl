@@ -39,6 +39,7 @@ mod submit_cost;
 mod texture_upload;
 pub mod title_textures;
 pub mod vram;
+mod copyfault_probe;
 mod worker_pool;
 
 use std::ffi::c_void;
