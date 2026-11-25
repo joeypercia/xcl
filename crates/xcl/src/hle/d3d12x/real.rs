@@ -4266,7 +4266,7 @@ unsafe fn keep_graphics_blob(key: (u64, usize), pso: *mut c_void, dxil_len: usiz
 /// Deterministic FNV-1a digest of every field in a translated PC graphics PSO (shaders, static
 /// samplers, blend/rasterizer/depth-stencil state, input layout, render target / depth formats,
 /// sample desc, topology, flags) for in-memory and on-disk driver blob caching.
-unsafe fn graphics_blob_key(
+pub(super) unsafe fn graphics_blob_key(
     copy: &D3D12_GRAPHICS_PIPELINE_STATE_DESC,
     vs_dxil: &[u8],
     ps_dxil: Option<&[u8]>,
@@ -4711,6 +4711,10 @@ unsafe fn translated_graphics_pso_once(this: *mut c_void, f: PsoFn, desc: *const
         return None;
     }
     let n = TRANSLATED_PSO.fetch_add(1, Ordering::Relaxed);
+    // `XCL_GRAPHICS_RECORD`: kept so that `xcl shaders --precompile --graphics` can build it again
+    if shader_bytes(&d.PS).is_none_or(is_console) {
+        super::graphics_record::note(d, vs, shader_bytes(&d.PS));
+    }
     note_pso_rs(*ppv, rs);
     TRANSLATED_GRAPHICS.lock().unwrap().get_or_insert_with(HashSet::new).insert(*ppv as usize);
     note_rect_list_gs(*ppv as usize, &copy, rect_gs.is_some());
