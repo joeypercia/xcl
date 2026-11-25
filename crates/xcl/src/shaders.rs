@@ -898,6 +898,10 @@ pub fn run(path: &Path, args: &[String]) -> i32 {
         let used = args.iter().any(|a| a == "--used-only").then(crate::hle::d3d12x::pso_async::earlier_used_keys);
         // the runtime's key: heap windows with `XCL_HEAP_WINDOWS=1` (`pso::mem_windows`)
         let windows = runtime_windows();
+        // `--graphics <file>`: the graphics pipelines a title's run recorded (XCL_GRAPHICS_RECORD)
+        if let Some(file) = args.iter().position(|a| a == "--graphics").and_then(|i| args.get(i + 1)) {
+            return precompile_graphics(&input, Path::new(file), windows, t0);
+        }
         return precompile(&input, opt("--limit").unwrap_or(usize::MAX), windows, opt("--split").map(|v| v != 0), only.as_deref(), pipelines, used.as_ref(), t0);
     }
     if args.iter().any(|a| a == "--direct") {
@@ -1202,6 +1206,72 @@ mod pipeline_cap_tests {
     }
 }
 
+#[cfg(test)]
+mod graphics_precompile_tests {
+    use super::{recomp, GraphicsTally, Ordering, Pipelines};
+    use crate::hle::d3d12x::real::GraphicsBuild;
+    use windows::Win32::Graphics::Direct3D12::*;
+    use windows::Win32::Graphics::Dxgi::Common::*;
+
+    /// A pipeline as `real::graphics_build` hands it over, with PC shaders standing in for
+    /// translated ones (XCL's root signature takes them: they bind nothing).
+    fn build(vs: &[u8], ps: &[u8]) -> GraphicsBuild {
+        let mut copy = D3D12_GRAPHICS_PIPELINE_STATE_DESC::default();
+        copy.BlendState.RenderTarget[0].RenderTargetWriteMask = 0xF;
+        copy.SampleMask = u32::MAX;
+        copy.RasterizerState.FillMode = D3D12_FILL_MODE_SOLID;
+        copy.RasterizerState.CullMode = D3D12_CULL_MODE_NONE;
+        copy.RasterizerState.DepthClipEnable = true.into();
+        copy.PrimitiveTopologyType = D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE;
+        copy.NumRenderTargets = 1;
+        copy.RTVFormats[0] = DXGI_FORMAT_R8G8B8A8_UNORM;
+        copy.SampleDesc.Count = 1;
+        let mut g = GraphicsBuild { copy, vs_dxil: vs.to_vec(), ps_dxil: Some(ps.to_vec()), rect_gs: None, samplers: vec![], ps_hash: 0 };
+        g.copy.VS = D3D12_SHADER_BYTECODE { pShaderBytecode: g.vs_dxil.as_ptr().cast(), BytecodeLength: g.vs_dxil.len() };
+        let ps = g.ps_dxil.as_ref().unwrap();
+        g.copy.PS = D3D12_SHADER_BYTECODE { pShaderBytecode: ps.as_ptr().cast(), BytecodeLength: ps.len() };
+        g
+    }
+
+    /// The first build saves the driver's blob, the next one is made from it, and a blob the
+    /// driver refuses is built again and replaced (as `--precompile --graphics` meets them).
+    #[test]
+    fn a_graphics_pipeline_built_ahead_leaves_a_blob_the_next_build_takes() {
+        if let Err(reason) = recomp::dxc::location() {
+            recomp::runner::skip_test(&format!("no DXC: {reason}"));
+            return;
+        }
+        let pipelines = match Pipelines::new() {
+            Ok(p) => p,
+            Err(reason) => {
+                recomp::runner::skip_test(&format!("no D3D12 device: {reason}"));
+                return;
+            }
+        };
+        let vs = recomp::dxc::compile("float4 main(uint v : SV_VertexID) : SV_Position { return float4(v & 1, v >> 1, 0, 1); }", "main", "vs_6_6", &[]).expect("VS");
+        let ps = recomp::dxc::compile("float4 main() : SV_Target { return float4(1, 0, 0, 1); }", "main", "ps_6_6", &[]).expect("PS");
+        let dir = std::env::temp_dir().join(format!("xcl-graphics-blob-{}-{}", std::process::id(), std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("graphics.pso");
+        let tally = GraphicsTally::default();
+        let n = |a: &std::sync::atomic::AtomicUsize| a.load(Ordering::Relaxed);
+
+        pipelines.make_graphics_at(build(&vs, &ps), &tally, Some(path.clone()));
+        assert_eq!((n(&tally.built), n(&tally.reused), n(&tally.failed)), (1, 0, 0));
+        let blob = std::fs::read(&path).expect("the driver's blob is saved");
+        assert!(!blob.is_empty());
+
+        pipelines.make_graphics_at(build(&vs, &ps), &tally, Some(path.clone()));
+        assert_eq!((n(&tally.built), n(&tally.reused), n(&tally.failed)), (1, 1, 0), "the saved blob is taken");
+
+        std::fs::write(&path, b"not a pipeline blob").unwrap();
+        pipelines.make_graphics_at(build(&vs, &ps), &tally, Some(path.clone()));
+        assert_eq!((n(&tally.built), n(&tally.reused), n(&tally.failed)), (2, 1, 0), "a refused blob is built again");
+        assert_ne!(std::fs::read(&path).unwrap(), b"not a pipeline blob", "and replaced");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+}
+
 // D3D12 devices and root signatures are free-threaded
 unsafe impl Sync for Pipelines {}
 
@@ -1318,6 +1388,191 @@ impl Pipelines {
             eprintln!("  pipelines: {} made, {} refused", self.made.load(Ordering::Relaxed), self.refused.load(Ordering::Relaxed));
         }
     }
+}
+
+/// What `--precompile --graphics` did with each recorded pipeline.
+#[derive(Default)]
+struct GraphicsTally {
+    /// built by the driver now, its blob saved
+    built: AtomicUsize,
+    /// its blob from an earlier pass or run was taken by the driver: nothing to do
+    reused: AtomicUsize,
+    /// its VS or PS is not in the pack (from a title's own DLLs, or a PC shader)
+    missing: AtomicUsize,
+    /// its shaders did not translate, or the driver refused the pipeline
+    failed: AtomicUsize,
+}
+
+impl Pipelines {
+    /// The graphics pipeline of `g`, with XCL's root signature for its samplers as the runtime
+    /// gives it (`real::abi_rs_for`), made and released; its driver blob saved where the runtime
+    /// looks for it (`driver_cache::graphics_path` of its `blob_key`).
+    fn make_graphics(&self, g: crate::hle::d3d12x::real::GraphicsBuild, tally: &GraphicsTally) {
+        self.make_graphics_at(g, tally, None)
+    }
+
+    /// `make_graphics`, its blob at `path_override` instead of the runtime's place (tests).
+    fn make_graphics_at(&self, mut g: crate::hle::d3d12x::real::GraphicsBuild, tally: &GraphicsTally, path_override: Option<PathBuf>) {
+        use crate::hle::d3d12x::real::driver_cache;
+        use windows::Win32::Graphics::Direct3D12::*;
+        let key: Vec<u32> = g.samplers.iter().flat_map(|(w, cmp)| w.iter().copied().chain([*cmp as u32])).collect();
+        let rs = {
+            let mut s = self.signatures.lock().unwrap();
+            match s.get(&key) {
+                Some(rs) => rs.clone(),
+                None => match recomp::pso::abi_root_signature_with(&self.dev, true, &g.samplers) {
+                    Ok(rs) => {
+                        s.insert(key, rs.clone());
+                        rs
+                    }
+                    Err(_) => {
+                        tally.failed.fetch_add(1, Ordering::Relaxed);
+                        return;
+                    }
+                },
+            }
+        };
+        g.copy.pRootSignature = std::mem::ManuallyDrop::new(Some(rs));
+        let (hash, bytes) = g.blob_key();
+        let path = path_override.or_else(|| driver_cache::graphics_path(hash, bytes));
+        let cached = path.as_deref().and_then(driver_cache::load);
+        {
+            let mut n = self.running.0.lock().unwrap();
+            while *n >= self.most {
+                n = self.running.1.wait(n).unwrap();
+            }
+            *n += 1;
+        }
+        let from_cache = cached.as_ref().and_then(|blob| {
+            g.copy.CachedPSO = D3D12_CACHED_PIPELINE_STATE { pCachedBlob: blob.as_ptr().cast(), CachedBlobSizeInBytes: blob.len() };
+            // only a pipeline carrying a blob of the size handed over is a hit (as for compute)
+            unsafe { self.dev.CreateGraphicsPipelineState::<ID3D12PipelineState>(&g.copy) }
+                .ok()
+                .filter(|pso| unsafe { pso.GetCachedBlob() }.is_ok_and(|b| unsafe { b.GetBufferSize() } == blob.len()))
+        });
+        g.copy.CachedPSO = D3D12_CACHED_PIPELINE_STATE::default();
+        let made = if from_cache.is_some() {
+            tally.reused.fetch_add(1, Ordering::Relaxed);
+            true
+        } else {
+            match unsafe { self.dev.CreateGraphicsPipelineState::<ID3D12PipelineState>(&g.copy) } {
+                Ok(pso) => {
+                    if let (Some(path), Ok(blob)) = (path.as_deref(), unsafe { pso.GetCachedBlob() }) {
+                        let (p, n) = unsafe { (blob.GetBufferPointer().cast::<u8>(), blob.GetBufferSize()) };
+                        if !p.is_null() && n != 0 {
+                            driver_cache::write(path, unsafe { std::slice::from_raw_parts(p, n) });
+                        }
+                    }
+                    tally.built.fetch_add(1, Ordering::Relaxed);
+                    true
+                }
+                Err(_) => false,
+            }
+        };
+        *self.running.0.lock().unwrap() -= 1;
+        self.running.1.notify_one();
+        drop(std::mem::ManuallyDrop::into_inner(std::mem::replace(&mut g.copy.pRootSignature, std::mem::ManuallyDrop::new(None))));
+        if !made {
+            tally.failed.fetch_add(1, Ordering::Relaxed);
+        }
+        let done = tally.built.load(Ordering::Relaxed) + tally.reused.load(Ordering::Relaxed);
+        if made && done % 50 == 0 {
+            eprintln!("  graphics pipelines: {} built, {} already had their blob", tally.built.load(Ordering::Relaxed), tally.reused.load(Ordering::Relaxed));
+        }
+    }
+}
+
+/// `--precompile --graphics <file>`: the graphics pipelines a title's run recorded
+/// (`XCL_GRAPHICS_RECORD=1`, `graphics-pipelines.txt`), made on the GPU from their shaders in the
+/// pack as the runtime makes them (`real::graphics_build`, the same GPU's wave size, the title's
+/// memory `windows`), and their driver blobs saved where the runtime looks. A title's next run
+/// after a driver update or a translation change then loads them instead of building each one
+/// during its world load. Pipelines whose shaders are not in the pack are counted and left out.
+fn precompile_graphics(input: &Input, file: &Path, windows: u32, t0: std::time::Instant) -> i32 {
+    use crate::hle::d3d12x::graphics_record;
+    let Ok(text) = std::fs::read_to_string(file) else {
+        eprintln!("xcl shaders --precompile --graphics: cannot read {}", file.display());
+        return 1;
+    };
+    let recorded = graphics_record::parse_all(&text);
+    if recorded.is_empty() {
+        eprintln!("xcl shaders --precompile --graphics: no recorded pipelines in {} (a title run with XCL_GRAPHICS_RECORD=1 writes them)", file.display());
+        return 1;
+    }
+    let pipelines = match Pipelines::new() {
+        Ok(p) => p,
+        Err(e) => {
+            eprintln!("xcl shaders --precompile --graphics: no D3D12 device: {e}");
+            return 1;
+        }
+    };
+    // the recorded pipelines' shaders, by the hash of their console containers
+    let want: HashSet<u64> = recorded.iter().flat_map(|r| [r.vs, r.ps]).filter(|&h| h != 0).collect();
+    let mut blobs: HashMap<u64, Vec<u8>> = HashMap::new();
+    for i in 0..input.len() {
+        if let (_, Some(blob)) = input.get(i) {
+            let h = shader::fnv64(&blob);
+            if want.contains(&h) {
+                blobs.insert(h, blob);
+            }
+        }
+    }
+    // the wave size the runtime picks for VS / PS on this GPU (`real::graphics_wave32`)
+    let split = recomp::pso::graphics_wave32_for_device(&pipelines.dev);
+    println!(
+        "building {} recorded graphics pipelines ({} of their {} shaders in the pack; {} memory windows{}{})",
+        recorded.len(),
+        blobs.len(),
+        want.len(),
+        windows & !recomp::HEAP_WINDOWS,
+        if windows & recomp::HEAP_WINDOWS != 0 { " from the descriptor heap" } else { "" },
+        if split { ", VS / PS in waves of 32" } else { "" }
+    );
+    let tally = GraphicsTally::default();
+    let next = AtomicUsize::new(0);
+    std::thread::scope(|s| {
+        for _ in 0..recomp::dxc::compile_threads() + 2 {
+            s.spawn(|| loop {
+                let i = next.fetch_add(1, Ordering::Relaxed);
+                let Some(r) = recorded.get(i) else { break };
+                let Some(vs) = blobs.get(&r.vs) else {
+                    tally.missing.fetch_add(1, Ordering::Relaxed);
+                    continue;
+                };
+                let ps = match r.ps {
+                    0 => None,
+                    h => match blobs.get(&h) {
+                        Some(p) => Some(p),
+                        None => {
+                            tally.missing.fetch_add(1, Ordering::Relaxed);
+                            continue;
+                        }
+                    },
+                };
+                let code = |b: &[u8]| windows::Win32::Graphics::Direct3D12::D3D12_SHADER_BYTECODE { pShaderBytecode: b.as_ptr().cast(), BytecodeLength: b.len() };
+                let mut d = r.desc();
+                d.VS = code(vs);
+                d.PS = ps.map(|p| code(p)).unwrap_or_default();
+                // SAFETY: `d` points at `vs`, `ps` and `r`'s input layout, all alive here
+                match unsafe { crate::hle::d3d12x::real::graphics_build(&d, vs, split, windows) } {
+                    Some(g) => pipelines.make_graphics(g, &tally),
+                    None => {
+                        tally.failed.fetch_add(1, Ordering::Relaxed);
+                    }
+                }
+            });
+        }
+    });
+    let n = |a: &AtomicUsize| a.load(Ordering::Relaxed);
+    println!(
+        "graphics pipelines: {} built (blob saved), {} already had a valid blob, {} with a shader not in the pack, {} failed; {:.1} s",
+        n(&tally.built),
+        n(&tally.reused),
+        n(&tally.missing),
+        n(&tally.failed),
+        t0.elapsed().as_secs_f64()
+    );
+    0
 }
 
 /// A compute program a title used in an earlier run (`--used-only`): its pipeline's key, as the

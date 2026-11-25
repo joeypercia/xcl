@@ -221,6 +221,7 @@ xcl disasm <shader.bin> [--hex]            # RDNA2 disassembler (console contain
 xcl shaders D:\data\shaders.rpf --top 50   # pack statistics; --recomp / --compile N
 xcl shaders D:\data\shaders.rpf --precompile --only cs --pipelines   # build compute pipelines and save driver blobs for the next run
 xcl shaders D:\data\shaders.rpf --precompile --only cs --pipelines --used-only   # only the compute pipelines an earlier run of the title used
+xcl shaders D:\data\shaders.rpf --precompile --graphics graphics-pipelines.txt   # build the graphics pipelines a run recorded (XCL_GRAPHICS_RECORD=1)
 xcl shaders D:\data\shaders.rpf --export-hlsl out --record-hash HEX  # exact compute HLSL for investigation
 xcl shaders D:\data\shaders.rpf --measure-pso HEX --repeat 3         # cold driver PSO timing (cache disabled)
 xcl rpf D:\data\shaders.rpf --extract NAME --out folder
@@ -255,7 +256,10 @@ xcl rpf D:\data\shaders.rpf --extract NAME --out folder
   0x…`): its dispatches are skipped.
 - With `XCL_GRAPHICS_RECORD=1`, each graphics pipeline built from the game's console VS / PS
   is written once to `graphics-pipelines.txt` next to the DXIL cache (the shaders by hash and
-  the pipeline's state; no shader bytes), so that it can be built again without the game.
+  the pipeline's state; no shader bytes), so that it can be built again without the game:
+  `xcl shaders <pack> --precompile --graphics <that file>` builds them and saves their driver
+  blobs, so that the next run after a driver or XCL update does not build them during its world
+  load (with `XCL_HEAP_WINDOWS` set as for the game's run).
 - With `XCL_DRED=1`, a D3D12 device removal logs GPU breadcrumbs in `xcl.log`.
   XCL examines up to 4,096 command lists and reports up to 64 unfinished lists, starting with
   those on which the GPU completed at least one operation.
