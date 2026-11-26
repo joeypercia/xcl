@@ -402,6 +402,21 @@ unsafe fn open_uma(device: &ID3D12Device) {
         if !u.is_committed_window(k) {
             continue;
         }
+        // on NVIDIA the window becomes a driver CUSTOM write-back L0 heap at its own address: the
+        // GPU's loads and atomics on imported pages are an order of magnitude slower (`uma_driver`)
+        if shadow_choice() != Some(true) && super::uma_driver::wanted(device) {
+            let (base, size) = u.window(k);
+            match super::uma_driver::remake(device, base, size) {
+                Ok((heap, buf)) => {
+                    u.set_driver_window(k);
+                    let (buf_raw, va, heap_raw) = super::uma_driver::raw(heap, buf);
+                    bufs[k] = (buf_raw, va);
+                    heaps[k] = Some(heap_raw);
+                    continue;
+                }
+                Err(e) => crate::xlog_warn!("D3D12.X: coherent window {k} stays imported: {e}"),
+            }
+        }
         let made = open(k).and_then(|heap| {
             let shadowed = heap.is_none();
             let heap = match heap {
@@ -1639,11 +1654,12 @@ fn uma_shadowed() -> bool {
 
 /// Sanitize a console buffer description and initial state for placement in a coherent
 /// cross-adapter UMA heap (`OpenExistingHeapFromAddress`).
-fn sanitize_coherent_buffer(desc: &D3D12_RESOURCE_DESC, state: usize) -> (D3D12_RESOURCE_DESC, u32) {
+fn sanitize_coherent_buffer(desc: &D3D12_RESOURCE_DESC, state: usize, cross_adapter: bool) -> (D3D12_RESOURCE_DESC, u32) {
     let mut d = *desc;
     d.Flags = D3D12_RESOURCE_FLAGS(d.Flags.0 & 0xFF);
-    // a shadowed window's heap is video memory, not a cross-adapter heap over process memory
-    if !uma_shadowed() {
+    // a shadowed window's heap is video memory, not a cross-adapter heap over process memory;
+    // nor is a driver heap (`uma_driver`)
+    if cross_adapter && !uma_shadowed() {
         d.Flags |= D3D12_RESOURCE_FLAG_ALLOW_CROSS_ADAPTER;
     }
     d.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
@@ -1682,8 +1698,8 @@ unsafe fn place_console_buffer(this: *mut c_void, props: usize, desc: usize, sta
         return None;
     };
     // the heap from OpenExistingHeapFromAddress is cross-adapter: row-major + sanitized flags & state
-    let (d, st) = sanitize_coherent_buffer(&d, state);
     let k = u.window_of(p)?;
+    let (d, st) = sanitize_coherent_buffer(&d, state, !u.is_driver_window(k));
     let heap = (*UMA_HEAPS.lock().unwrap().get(k)?)?;
     let hr = dev_create_placed_resource(this, heap, p - u.window(k).0, &d as *const _ as usize, st as usize, clear, riid, ppv);
     if hr < 0 || (*ppv).is_null() {
@@ -1773,7 +1789,7 @@ pub(super) unsafe fn place_at_title_address(this: *mut c_void, va: usize, desc: 
         return Some(hr);
     }
     let heap = (*UMA_HEAPS.lock().unwrap().get(k)?)?;
-    if !u.shadowed() {
+    if !u.shadowed() && !u.is_driver_window(k) {
         d.Flags |= D3D12_RESOURCE_FLAG_ALLOW_CROSS_ADAPTER;
     }
     d.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
@@ -9763,7 +9779,7 @@ mod readback_routing_tests {
         };
         let console_state = 0x0010_0000usize | (D3D12_RESOURCE_STATE_COPY_DEST.0 as usize);
 
-        let (clean, st) = sanitize_coherent_buffer(&raw_desc, console_state);
+        let (clean, st) = sanitize_coherent_buffer(&raw_desc, console_state, true);
         assert_eq!(clean.Alignment, 0);
         assert_eq!(clean.Layout, D3D12_TEXTURE_LAYOUT_ROW_MAJOR);
         assert_eq!(
